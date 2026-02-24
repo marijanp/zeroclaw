@@ -55,17 +55,11 @@ impl WebFetchTool {
     }
 
     fn validate_url(&self, raw_url: &str) -> anyhow::Result<String> {
-        validate_url(
+        validate_target_url(
             raw_url,
-            &DomainPolicy {
-                allowed_domains: &self.allowed_domains,
-                blocked_domains: &self.blocked_domains,
-                allowed_field_name: "web_fetch.allowed_domains",
-                blocked_field_name: Some("web_fetch.blocked_domains"),
-                empty_allowed_message: "web_fetch tool is enabled but no allowed_domains are configured. Add [web_fetch].allowed_domains in config.toml",
-                scheme_policy: UrlSchemePolicy::HttpOrHttps,
-                ipv6_error_context: "web_fetch",
-            },
+            &self.allowed_domains,
+            &self.blocked_domains,
+            "web_fetch",
         )
     }
 
@@ -340,19 +334,253 @@ impl Tool for WebFetchTool {
             )),
         };
 
-        match result {
-            Ok(output) => Ok(ToolResult {
-                success: true,
-                output: self.truncate_response(&output),
-                error: None,
-            }),
-            Err(e) => Ok(ToolResult {
+        let allowed_domains = self.allowed_domains.clone();
+        let blocked_domains = self.blocked_domains.clone();
+        let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= 10 {
+                return attempt.error(std::io::Error::other("Too many redirects (max 10)"));
+            }
+
+            if let Err(err) = validate_target_url(
+                attempt.url().as_str(),
+                &allowed_domains,
+                &blocked_domains,
+                "web_fetch",
+            ) {
+                return attempt.error(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("Blocked redirect target: {err}"),
+                ));
+            }
+
+            attempt.follow()
+        });
+
+        let builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(timeout_secs))
+            .connect_timeout(Duration::from_secs(10))
+            .redirect(redirect_policy)
+            .user_agent("ZeroClaw/0.1 (web_fetch)");
+        let builder = crate::config::apply_runtime_proxy_to_builder(builder, "tool.web_fetch");
+        let client = match builder.build() {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to build HTTP client: {e}")),
+                })
+            }
+        };
+
+        let response = match client.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("HTTP request failed: {e}")),
+                })
+            }
+        };
+
+        let status = response.status();
+        if !status.is_success() {
+            return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(e.to_string()),
             }),
         }
     }
+}
+
+// ── Helper functions (independent from http_request.rs per DRY rule-of-three) ──
+
+fn validate_target_url(
+    raw_url: &str,
+    allowed_domains: &[String],
+    blocked_domains: &[String],
+    tool_name: &str,
+) -> anyhow::Result<String> {
+    let url = raw_url.trim();
+
+    if url.is_empty() {
+        anyhow::bail!("URL cannot be empty");
+    }
+
+    if url.chars().any(char::is_whitespace) {
+        anyhow::bail!("URL cannot contain whitespace");
+    }
+
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        anyhow::bail!("Only http:// and https:// URLs are allowed");
+    }
+
+    if allowed_domains.is_empty() {
+        anyhow::bail!(
+            "{tool_name} tool is enabled but no allowed_domains are configured. \
+             Add [{tool_name}].allowed_domains in config.toml"
+        );
+    }
+
+    let host = extract_host(url)?;
+
+    if is_private_or_local_host(&host) {
+        anyhow::bail!("Blocked local/private host: {host}");
+    }
+
+    if host_matches_allowlist(&host, blocked_domains) {
+        anyhow::bail!("Host '{host}' is in {tool_name}.blocked_domains");
+    }
+
+    if !host_matches_allowlist(&host, allowed_domains) {
+        anyhow::bail!("Host '{host}' is not in {tool_name}.allowed_domains");
+    }
+
+    Ok(url.to_string())
+}
+
+fn normalize_allowed_domains(domains: Vec<String>) -> Vec<String> {
+    let mut normalized = domains
+        .into_iter()
+        .filter_map(|d| normalize_domain(&d))
+        .collect::<Vec<_>>();
+    normalized.sort_unstable();
+    normalized.dedup();
+    normalized
+}
+
+fn normalize_domain(raw: &str) -> Option<String> {
+    let mut d = raw.trim().to_lowercase();
+    if d.is_empty() {
+        return None;
+    }
+
+    if let Some(stripped) = d.strip_prefix("https://") {
+        d = stripped.to_string();
+    } else if let Some(stripped) = d.strip_prefix("http://") {
+        d = stripped.to_string();
+    }
+
+    if let Some((host, _)) = d.split_once('/') {
+        d = host.to_string();
+    }
+
+    d = d.trim_start_matches('.').trim_end_matches('.').to_string();
+
+    if let Some((host, _)) = d.split_once(':') {
+        d = host.to_string();
+    }
+
+    if d.is_empty() || d.chars().any(char::is_whitespace) {
+        return None;
+    }
+
+    Some(d)
+}
+
+fn extract_host(url: &str) -> anyhow::Result<String> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .ok_or_else(|| anyhow::anyhow!("Only http:// and https:// URLs are allowed"))?;
+
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Invalid URL"))?;
+
+    if authority.is_empty() {
+        anyhow::bail!("URL must include a host");
+    }
+
+    if authority.contains('@') {
+        anyhow::bail!("URL userinfo is not allowed");
+    }
+
+    if authority.starts_with('[') {
+        anyhow::bail!("IPv6 hosts are not supported in web_fetch");
+    }
+
+    let host = authority
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_end_matches('.')
+        .to_lowercase();
+
+    if host.is_empty() {
+        anyhow::bail!("URL must include a valid host");
+    }
+
+    Ok(host)
+}
+
+fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
+    if allowed_domains.iter().any(|domain| domain == "*") {
+        return true;
+    }
+
+    allowed_domains.iter().any(|domain| {
+        host == domain
+            || host
+                .strip_suffix(domain)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    })
+}
+
+fn is_private_or_local_host(host: &str) -> bool {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+
+    let has_local_tld = bare
+        .rsplit('.')
+        .next()
+        .is_some_and(|label| label == "local");
+
+    if bare == "localhost" || bare.ends_with(".localhost") || has_local_tld {
+        return true;
+    }
+
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => is_non_global_v4(v4),
+            std::net::IpAddr::V6(v6) => is_non_global_v6(v6),
+        };
+    }
+
+    false
+}
+
+fn is_non_global_v4(v4: std::net::Ipv4Addr) -> bool {
+    let [a, b, c, _] = v4.octets();
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || v4.is_multicast()
+        || (a == 100 && (64..=127).contains(&b))
+        || a >= 240
+        || (a == 192 && b == 0 && (c == 0 || c == 2))
+        || (a == 198 && b == 51)
+        || (a == 203 && b == 0)
+        || (a == 198 && (18..=19).contains(&b))
+}
+
+fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
+    let segs = v6.segments();
+    v6.is_loopback()
+        || v6.is_unspecified()
+        || v6.is_multicast()
+        || (segs[0] & 0xfe00) == 0xfc00
+        || (segs[0] & 0xffc0) == 0xfe80
+        || (segs[0] == 0x2001 && segs[1] == 0x0db8)
+        || v6.to_ipv4_mapped().is_some_and(is_non_global_v4)
 }
 
 #[cfg(test)]
@@ -548,6 +776,41 @@ mod tests {
             .to_string();
         assert!(err.contains("local/private"));
     }
+
+    #[test]
+    fn redirect_target_validation_allows_permitted_host() {
+        let allowed = vec!["example.com".to_string()];
+        let blocked = vec![];
+        assert!(validate_target_url(
+            "https://docs.example.com/page",
+            &allowed,
+            &blocked,
+            "web_fetch"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn redirect_target_validation_blocks_private_host() {
+        let allowed = vec!["example.com".to_string()];
+        let blocked = vec![];
+        let err = validate_target_url("https://127.0.0.1/admin", &allowed, &blocked, "web_fetch")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"));
+    }
+
+    #[test]
+    fn redirect_target_validation_blocks_blocklisted_host() {
+        let allowed = vec!["*".to_string()];
+        let blocked = vec!["evil.com".to_string()];
+        let err = validate_target_url("https://evil.com/phish", &allowed, &blocked, "web_fetch")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("blocked_domains"));
+    }
+
+    // ── Security policy ──────────────────────────────────────────
 
     #[tokio::test]
     async fn blocks_readonly_mode() {
