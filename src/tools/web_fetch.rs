@@ -4,6 +4,7 @@ use super::url_validation::{
 };
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
@@ -76,196 +77,22 @@ impl WebFetchTool {
         }
     }
 
-    fn effective_timeout_secs(&self) -> u64 {
-        if self.timeout_secs == 0 {
-            tracing::warn!("web_fetch: timeout_secs is 0, using safe default of 30s");
-            30
-        } else {
-            self.timeout_secs
-        }
-    }
+    async fn read_response_text_limited(
+        &self,
+        response: reqwest::Response,
+    ) -> anyhow::Result<String> {
+        let mut bytes_stream = response.bytes_stream();
+        let hard_cap = self.max_response_size.saturating_add(1);
+        let mut bytes = Vec::new();
 
-    #[allow(unused_variables)]
-    fn convert_html_to_output(&self, body: &str) -> anyhow::Result<String> {
-        match self.provider.as_str() {
-            "fast_html2md" => {
-                #[cfg(feature = "web-fetch-html2md")]
-                {
-                    Ok(html2md::rewrite_html(body, false))
-                }
-                #[cfg(not(feature = "web-fetch-html2md"))]
-                {
-                    anyhow::bail!(
-                        "web_fetch provider 'fast_html2md' requires Cargo feature 'web-fetch-html2md'"
-                    );
-                }
+        while let Some(chunk_result) = bytes_stream.next().await {
+            let chunk = chunk_result?;
+            if append_chunk_with_cap(&mut bytes, &chunk, hard_cap) {
+                break;
             }
-            "nanohtml2text" => {
-                #[cfg(feature = "web-fetch-plaintext")]
-                {
-                    Ok(nanohtml2text::html2text(body))
-                }
-                #[cfg(not(feature = "web-fetch-plaintext"))]
-                {
-                    anyhow::bail!(
-                        "web_fetch provider 'nanohtml2text' requires Cargo feature 'web-fetch-plaintext'"
-                    );
-                }
-            }
-            _ => anyhow::bail!(
-                "Unknown web_fetch provider: '{}'. Set tools.web_fetch.provider to 'fast_html2md', 'nanohtml2text', or 'firecrawl' in config.toml",
-                self.provider
-            ),
-        }
-    }
-
-    fn build_http_client(&self) -> anyhow::Result<reqwest::Client> {
-        let builder = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.effective_timeout_secs()))
-            .connect_timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent("ZeroClaw/0.1 (web_fetch)");
-        let builder = crate::config::apply_runtime_proxy_to_builder(builder, "tool.web_fetch");
-        Ok(builder.build()?)
-    }
-
-    async fn fetch_with_http_provider(&self, url: &str) -> anyhow::Result<String> {
-        let client = self.build_http_client()?;
-        let response = client.get(url).send().await?;
-
-        if response.status().is_redirection() {
-            let location = response
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| anyhow::anyhow!("Redirect response missing Location header"))?;
-
-            let redirected_url = reqwest::Url::parse(url)
-                .and_then(|base| base.join(location))
-                .or_else(|_| reqwest::Url::parse(location))
-                .map_err(|e| anyhow::anyhow!("Invalid redirect Location header: {e}"))?
-                .to_string();
-
-            // Validate redirect target with the same SSRF/allowlist policy.
-            self.validate_url(&redirected_url)?;
-            return Ok(redirected_url);
         }
 
-        let status = response.status();
-        if !status.is_success() {
-            anyhow::bail!(
-                "HTTP {} {}",
-                status.as_u16(),
-                status.canonical_reason().unwrap_or("Unknown")
-            );
-        }
-
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_lowercase();
-
-        let body = response.text().await?;
-
-        if content_type.contains("text/plain")
-            || content_type.contains("text/markdown")
-            || content_type.contains("application/json")
-        {
-            return Ok(body);
-        }
-
-        if content_type.contains("text/html") || content_type.is_empty() {
-            return self.convert_html_to_output(&body);
-        }
-
-        anyhow::bail!(
-            "Unsupported content type: {content_type}. web_fetch supports text/html, text/plain, text/markdown, and application/json."
-        )
-    }
-
-    #[cfg(feature = "firecrawl")]
-    async fn fetch_with_firecrawl(&self, url: &str) -> anyhow::Result<String> {
-        let auth_token = match self.api_key.as_ref() {
-            Some(raw) if !raw.trim().is_empty() => raw.trim(),
-            _ => {
-                anyhow::bail!(
-                    "web_fetch provider 'firecrawl' requires [web_fetch].api_key in config.toml"
-                );
-            }
-        };
-
-        let api_url = self
-            .api_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("https://api.firecrawl.dev");
-        let endpoint = format!("{}/v1/scrape", api_url.trim_end_matches('/'));
-
-        let response = self
-            .build_http_client()?
-            .post(endpoint)
-            .header(
-                reqwest::header::AUTHORIZATION,
-                format!("Bearer {auth_token}"),
-            )
-            .json(&json!({
-                "url": url,
-                "formats": ["markdown"],
-                "onlyMainContent": true,
-                "timeout": (self.effective_timeout_secs() * 1000) as u64
-            }))
-            .send()
-            .await?;
-        let status = response.status();
-        let body = response.text().await?;
-
-        if !status.is_success() {
-            anyhow::bail!(
-                "Firecrawl scrape failed with status {}: {}",
-                status.as_u16(),
-                body
-            );
-        }
-
-        let parsed: serde_json::Value = serde_json::from_str(&body)
-            .map_err(|e| anyhow::anyhow!("Invalid Firecrawl response JSON: {e}"))?;
-        if !parsed
-            .get("success")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
-            let error = parsed
-                .get("error")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown error");
-            anyhow::bail!("Firecrawl scrape failed: {error}");
-        }
-
-        let data = parsed
-            .get("data")
-            .ok_or_else(|| anyhow::anyhow!("Firecrawl response missing data field"))?;
-        let output = data
-            .get("markdown")
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| data.get("html").and_then(serde_json::Value::as_str))
-            .or_else(|| data.get("rawHtml").and_then(serde_json::Value::as_str))
-            .unwrap_or("")
-            .to_string();
-
-        if output.trim().is_empty() {
-            anyhow::bail!("Firecrawl returned empty content");
-        }
-
-        Ok(output)
-    }
-
-    #[cfg(not(feature = "firecrawl"))]
-    #[allow(clippy::unused_async)]
-    async fn fetch_with_firecrawl(&self, _url: &str) -> anyhow::Result<String> {
-        anyhow::bail!("web_fetch provider 'firecrawl' requires Cargo feature 'firecrawl'")
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 }
 
@@ -392,6 +219,57 @@ impl Tool for WebFetchTool {
                 error: Some(e.to_string()),
             }),
         }
+
+        // Determine content type for processing strategy
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_lowercase();
+
+        let body_mode = if content_type.contains("text/html") || content_type.is_empty() {
+            "html"
+        } else if content_type.contains("text/plain")
+            || content_type.contains("text/markdown")
+            || content_type.contains("application/json")
+        {
+            "plain"
+        } else {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Unsupported content type: {content_type}. \
+                     web_fetch supports text/html, text/plain, text/markdown, and application/json."
+                )),
+            });
+        };
+
+        let body = match self.read_response_text_limited(response).await {
+            Ok(t) => t,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to read response body: {e}")),
+                })
+            }
+        };
+
+        let text = if body_mode == "html" {
+            nanohtml2text::html2text(&body)
+        } else {
+            body
+        };
+
+        let output = self.truncate_response(&text);
+
+        Ok(ToolResult {
+            success: true,
+            output,
+            error: None,
+        })
     }
 }
 
@@ -438,7 +316,24 @@ fn validate_target_url(
         anyhow::bail!("Host '{host}' is not in {tool_name}.allowed_domains");
     }
 
+    validate_resolved_host_is_public(&host)?;
+
     Ok(url.to_string())
+}
+
+fn append_chunk_with_cap(buffer: &mut Vec<u8>, chunk: &[u8], hard_cap: usize) -> bool {
+    if buffer.len() >= hard_cap {
+        return true;
+    }
+
+    let remaining = hard_cap - buffer.len();
+    if chunk.len() > remaining {
+        buffer.extend_from_slice(&chunk[..remaining]);
+        return true;
+    }
+
+    buffer.extend_from_slice(chunk);
+    buffer.len() >= hard_cap
 }
 
 fn normalize_allowed_domains(domains: Vec<String>) -> Vec<String> {
@@ -554,6 +449,43 @@ fn is_private_or_local_host(host: &str) -> bool {
     }
 
     false
+}
+
+#[cfg(not(test))]
+fn validate_resolved_host_is_public(host: &str) -> anyhow::Result<()> {
+    use std::net::ToSocketAddrs;
+
+    let ips = (host, 0)
+        .to_socket_addrs()
+        .map_err(|e| anyhow::anyhow!("Failed to resolve host '{host}': {e}"))?
+        .map(|addr| addr.ip())
+        .collect::<Vec<_>>();
+
+    validate_resolved_ips_are_public(host, &ips)
+}
+
+#[cfg(test)]
+fn validate_resolved_host_is_public(_host: &str) -> anyhow::Result<()> {
+    // DNS checks are covered by validate_resolved_ips_are_public unit tests.
+    Ok(())
+}
+
+fn validate_resolved_ips_are_public(host: &str, ips: &[std::net::IpAddr]) -> anyhow::Result<()> {
+    if ips.is_empty() {
+        anyhow::bail!("Failed to resolve host '{host}'");
+    }
+
+    for ip in ips {
+        let non_global = match ip {
+            std::net::IpAddr::V4(v4) => is_non_global_v4(*v4),
+            std::net::IpAddr::V6(v6) => is_non_global_v6(*v6),
+        };
+        if non_global {
+            anyhow::bail!("Blocked host '{host}' resolved to non-global address {ip}");
+        }
+    }
+
+    Ok(())
 }
 
 fn is_non_global_v4(v4: std::net::Ipv4Addr) -> bool {
@@ -936,19 +868,38 @@ mod tests {
         assert!(tool.validate_url("https://example.com").is_ok());
     }
 
-    #[tokio::test]
-    async fn firecrawl_provider_requires_api_key() {
-        let tool = test_tool_with_provider(vec!["*"], vec![], "firecrawl", None, None);
-        let result = tool
-            .execute(json!({"url": "https://example.com"}))
-            .await
-            .unwrap();
-        assert!(!result.success);
-        let error = result.error.unwrap_or_default();
-        if cfg!(feature = "firecrawl") {
-            assert!(error.contains("requires [web_fetch].api_key"));
-        } else {
-            assert!(error.contains("requires Cargo feature 'firecrawl'"));
-        }
+    #[test]
+    fn append_chunk_with_cap_truncates_and_stops() {
+        let mut buffer = Vec::new();
+        assert!(!append_chunk_with_cap(&mut buffer, b"hello", 8));
+        assert!(append_chunk_with_cap(&mut buffer, b"world", 8));
+        assert_eq!(buffer, b"hellowor");
+    }
+
+    #[test]
+    fn resolved_private_ip_is_rejected() {
+        let ips = vec!["127.0.0.1".parse().unwrap()];
+        let err = validate_resolved_ips_are_public("example.com", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("non-global address"));
+    }
+
+    #[test]
+    fn resolved_mixed_ips_are_rejected() {
+        let ips = vec![
+            "93.184.216.34".parse().unwrap(),
+            "10.0.0.1".parse().unwrap(),
+        ];
+        let err = validate_resolved_ips_are_public("example.com", &ips)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("non-global address"));
+    }
+
+    #[test]
+    fn resolved_public_ips_are_allowed() {
+        let ips = vec!["93.184.216.34".parse().unwrap(), "1.1.1.1".parse().unwrap()];
+        assert!(validate_resolved_ips_are_public("example.com", &ips).is_ok());
     }
 }
