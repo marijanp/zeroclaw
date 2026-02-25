@@ -33,13 +33,6 @@
             (import ./overlay.nix)
           ];
         };
-        rustToolchain = pkgs.fenix.stable.withComponents [
-          "cargo"
-          "clippy"
-          "rust-src"
-          "rustc"
-          "rustfmt"
-        ];
       in {
         formatter = pkgs.nixfmt-tree;
         packages = {
@@ -47,8 +40,8 @@
           inherit (pkgs) zeroclaw;
         };
         devShells.default = pkgs.mkShell {
+          inputsFrom = [ pkgs.zeroclaw ];
           packages = [
-            rustToolchain
             pkgs.rust-analyzer
           ];
         };
