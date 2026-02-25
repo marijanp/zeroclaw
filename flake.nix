@@ -1,6 +1,5 @@
 {
   inputs = {
-    flake-utils.url = "github:numtide/flake-utils";
     fenix = {
       url = "github:nix-community/fenix";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -15,31 +14,51 @@
       fenix,
       nixpkgs,
     }:
-    flake-utils.lib.eachDefaultSystem (
-      system:
-      let
-        pkgs = import nixpkgs {
-          inherit system;
-          overlays = [
-            fenix.overlays.default
-            (import ./overlay.nix)
-          ];
-        };
-      in
-      {
-        formatter = pkgs.nixfmt-tree;
+    let
+      # there is also nixpkgs.lib.systems.flakeExposed
+      supportedSystems = [
+        "x86_64-linux"
+        "aarch64-linux"
+        "x86_64-darwin"
+        "aarch64-darwin"
+      ];
+      withPkgs =
+        pkgsCallback:
+        nixpkgs.lib.genAttrs supportedSystems (
+          system:
+          let
+            pkgs = import nixpkgs {
+              inherit system;
+              overlays = [
+                fenix.overlays.default
+                (import ./overlay.nix)
+              ];
+            };
+          in
+          pkgsCallback { inherit pkgs system; }
+        );
+    in
+    {
+      formatter = withPkgs ({ pkgs, ... }: pkgs.nixfmt-tree);
 
-        packages = {
+      packages = withPkgs (
+        { pkgs, system }:
+        {
           default = self.packages.${system}.zeroclaw;
           inherit (pkgs) zeroclaw;
-        };
+        }
+      );
 
-        devShells.default = pkgs.mkShell {
-          inputsFrom = [ pkgs.zeroclaw ];
-          packages = [
-            pkgs.rust-analyzer
-          ];
-        };
-      }
-    );
+      devShells = withPkgs (
+        { pkgs, ... }:
+        {
+          default = pkgs.mkShell {
+            inputsFrom = [ pkgs.zeroclaw ];
+            packages = [
+              pkgs.rust-analyzer
+            ];
+          };
+        }
+      );
+    };
 }
