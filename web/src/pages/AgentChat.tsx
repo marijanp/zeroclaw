@@ -10,9 +10,18 @@ interface ChatMessage {
   timestamp: Date;
 }
 
+interface PersistedChatMessage {
+  id: string;
+  role: 'user' | 'agent';
+  content: string;
+  timestamp: string;
+}
+
 let fallbackMessageIdCounter = 0;
 const EMPTY_DONE_FALLBACK =
   'Tool execution completed, but no final response text was returned.';
+const CHAT_HISTORY_STORAGE_KEY = 'zeroclaw.agent_chat.messages.v1';
+const MAX_PERSISTED_MESSAGES = 500;
 
 function makeMessageId(): string {
   const uuid = globalThis.crypto?.randomUUID?.();
@@ -24,8 +33,74 @@ function makeMessageId(): string {
     .slice(2, 10)}`;
 }
 
+function loadPersistedMessages(): ChatMessage[] {
+  if (typeof window === 'undefined') {
+    return [];
+  }
+
+  try {
+    const raw = sessionStorage.getItem(CHAT_HISTORY_STORAGE_KEY);
+    if (!raw) {
+      return [];
+    }
+
+    const parsed = JSON.parse(raw) as PersistedChatMessage[];
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+
+    return parsed
+      .map((msg): ChatMessage | null => {
+        if (!msg || typeof msg !== 'object') {
+          return null;
+        }
+
+        const timestamp = new Date(msg.timestamp);
+        if (
+          typeof msg.id !== 'string' ||
+          (msg.role !== 'user' && msg.role !== 'agent') ||
+          typeof msg.content !== 'string' ||
+          Number.isNaN(timestamp.getTime())
+        ) {
+          return null;
+        }
+
+        return {
+          id: msg.id,
+          role: msg.role,
+          content: msg.content,
+          timestamp,
+        };
+      })
+      .filter((msg): msg is ChatMessage => msg !== null)
+      .slice(-MAX_PERSISTED_MESSAGES);
+  } catch {
+    return [];
+  }
+}
+
+function persistMessages(messages: ChatMessage[]): void {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  try {
+    const payload: PersistedChatMessage[] = messages
+      .slice(-MAX_PERSISTED_MESSAGES)
+      .map((msg) => ({
+        id: msg.id,
+        role: msg.role,
+        content: msg.content,
+        timestamp: msg.timestamp.toISOString(),
+      }));
+    sessionStorage.setItem(CHAT_HISTORY_STORAGE_KEY, JSON.stringify(payload));
+  } catch {
+    // sessionStorage may be unavailable in private modes; fail silently.
+  }
+}
+
 export default function AgentChat() {
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>(() => loadPersistedMessages());
   const [input, setInput] = useState('');
   const [typing, setTyping] = useState(false);
   const [connected, setConnected] = useState(false);
@@ -130,6 +205,10 @@ export default function AgentChat() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, typing]);
+
+  useEffect(() => {
+    persistMessages(messages);
+  }, [messages]);
 
   const handleSend = () => {
     const trimmed = input.trim();
