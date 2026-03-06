@@ -55,4 +55,6 @@ rustPlatform.buildRustPackage (finalAttrs: {
   postFixup = ''
     find "$out" -type f -exec remove-references-to -t ${rustToolchain} '{}' +
   '';
+
+  meta.mainProgram = "zeroclaw";
 })
