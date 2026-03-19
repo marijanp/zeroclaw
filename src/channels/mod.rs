@@ -46,6 +46,7 @@ pub mod transcription;
 pub mod tts;
 pub mod twitter;
 pub mod wati;
+pub mod xmpp;
 pub mod webhook;
 pub mod wecom;
 pub mod whatsapp;
@@ -82,6 +83,7 @@ pub use traits::{Channel, SendMessage};
 #[allow(unused_imports)]
 pub use tts::{TtsManager, TtsProvider};
 pub use twitter::TwitterChannel;
+pub use xmpp::XmppChannel;
 pub use wati::WatiChannel;
 pub use webhook::WebhookChannel;
 pub use wecom::WeComChannel;
@@ -3496,6 +3498,17 @@ fn collect_configured_channels(
                 sasl_password: irc.sasl_password.clone(),
                 verify_tls: irc.verify_tls.unwrap_or(true),
             })),
+        });
+    }
+
+    if let Some(ref xm) = config.channels_config.xmpp {
+        channels.push(ConfiguredChannel {
+            display_name: "XMPP",
+            channel: Arc::new(XmppChannel::new(
+                xm.jid.clone(),
+                xm.password.clone(),
+                xm.allowed_users.clone(),
+            )),
         });
     }
 

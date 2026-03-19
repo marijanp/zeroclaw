@@ -4269,6 +4269,8 @@ pub struct ChannelsConfig {
     pub email: Option<crate::channels::email_channel::EmailConfig>,
     /// IRC channel configuration.
     pub irc: Option<IrcConfig>,
+    /// XMPP (Jabber) channel configuration.
+    pub xmpp: Option<XmppConfig>,
     /// Lark channel configuration.
     pub lark: Option<LarkConfig>,
     /// Feishu channel configuration.
@@ -4378,6 +4380,10 @@ impl ChannelsConfig {
                 self.irc.is_some()
             ),
             (
+                Box::new(ConfigWrapper::new(self.xmpp.as_ref())),
+                self.xmpp.is_some(),
+            ),
+            (
                 Box::new(ConfigWrapper::new(self.lark.as_ref())),
                 self.lark.is_some(),
             ),
@@ -4453,6 +4459,7 @@ impl Default for ChannelsConfig {
             nextcloud_talk: None,
             email: None,
             irc: None,
+            xmpp: None,
             lark: None,
             feishu: None,
             dingtalk: None,
@@ -4919,6 +4926,27 @@ impl ChannelConfig for IrcConfig {
 
 fn default_irc_port() -> u16 {
     6697
+}
+
+/// XMPP (Jabber) channel configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct XmppConfig {
+    /// Bot Jabber ID (e.g. "bot@example.com").
+    pub jid: String,
+    /// XMPP account password.
+    pub password: String,
+    /// Allowed bare JIDs (e.g. "user@example.com") or "*" for all.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+}
+
+impl ChannelConfig for XmppConfig {
+    fn name() -> &'static str {
+        "XMPP"
+    }
+    fn desc() -> &'static str {
+        "XMPP (Jabber) via StartTLS"
+    }
 }
 
 /// How ZeroClaw receives events from Feishu / Lark.
@@ -8386,6 +8414,7 @@ default_temperature = 0.7
                 clawdtalk: None,
                 reddit: None,
                 bluesky: None,
+                xmpp: None,
                 message_timeout_secs: 300,
                 ack_reactions: true,
                 show_tool_calls: true,
@@ -9149,6 +9178,7 @@ allowed_users = ["@ops:matrix.org"]
             nextcloud_talk: None,
             email: None,
             irc: None,
+            xmpp: None,
             lark: None,
             feishu: None,
             dingtalk: None,
@@ -9395,6 +9425,7 @@ channel_id = "C123"
             nextcloud_talk: None,
             email: None,
             irc: None,
+            xmpp: None,
             lark: None,
             feishu: None,
             dingtalk: None,
